@@ -168,7 +168,7 @@
 // CONSTANTS & CONFIG
 // ═══════════════════════════════════════════════════════
 const API_URL   = 'https://llm-wrapper-741152993481.asia-south1.run.app/llm/query';
-const API_TOKEN = 'lw_qJi9U0BrNLqpYdhPhYJ8u7UPECRxNEscUF0CR0zgJZQ';
+const API_TOKEN = 'lw_wl2-H5-0-11jFk0C056wifZOAlVEKLSqNC9Urm91K64';
 
 const LANG_NAMES = { en: 'English', hi: 'Hindi', ta: 'Tamil', mr: 'Marathi' };
 const LANG_BCP47 = { en: 'en-IN', hi: 'hi-IN', ta: 'ta-IN', mr: 'mr-IN' };
@@ -292,6 +292,7 @@ let userProfile = {
 let chatHistory          = [];
 let isWaiting            = false;
 let recommendationMade   = false;
+let lastUserMessage      = '';
 let currentLanguage      = 'en';   // selected UI + LLM language
 let recognition          = null;   // SpeechRecognition instance
 let isListening          = false;
@@ -506,19 +507,33 @@ ${productCtx}
 // LLM API CALL
 // ═══════════════════════════════════════════════════════
 async function callLLM(retryOnEmpty = true) {
-  const systemCtx  = buildSystemContext();
-  const historyText = chatHistory.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
-  const fullPrompt  = `${systemCtx}\n\n${historyText}`;
+  const systemCtx = buildSystemContext();
+  const MAX_CHARS = 28000; // stay well under the 32768 API limit
+
+  // Trim oldest message pairs until prompt fits
+  let history = [...chatHistory];
+  let historyText = history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
+  while ((systemCtx.length + historyText.length) > MAX_CHARS && history.length > 2) {
+    history = history.slice(2); // drop oldest user+assistant pair
+    historyText = history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
+  }
+
+  const fullPrompt = `${systemCtx}\n\n${historyText}`;
 
   let res;
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
     res = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_TOKEN}` },
-      body: JSON.stringify({ prompt: fullPrompt })
+      body: JSON.stringify({ prompt: fullPrompt }),
+      signal: controller.signal
     });
+    clearTimeout(timeout);
   } catch (networkErr) {
     console.error('Network error:', networkErr);
+    if (networkErr.name === 'AbortError') throw new Error('Request timed out. Please try again.');
     throw new Error('NETWORK: ' + networkErr.message);
   }
 
@@ -632,7 +647,10 @@ function speakText(text, btn) {
   // Toggle: if this button is already speaking, stop it
   if (btn && btn.classList.contains('speaking')) {
     synth.cancel();
-    return; // onend will reset the button
+    // Manually reset — Safari doesn't always fire onend after cancel
+    btn.classList.remove('speaking');
+    btn.textContent = '🔊 Read aloud';
+    return;
   }
 
   // Cancel any other ongoing speech and reset all speak buttons
@@ -838,6 +856,7 @@ async function sendMessage(text) {
   sendBtn.disabled = true;
   if (synth) synth.cancel();
 
+  lastUserMessage = text;
   addMessage('user', escapeHtml(text));
   updateProfileFromText(text);
   chatHistory.push({ role: 'user', content: text });
@@ -854,6 +873,9 @@ async function sendMessage(text) {
         specialHtml += `<strong>${p.name}</strong>${buildTenureTable(p, userProfile.loanAmount)}`;
       });
       specialChips = ['Download summary', 'Which is best for me?', 'What documents are needed?'];
+    } else {
+      specialHtml = '⚠️ Please share your loan amount, income, existing EMI, and employment type first so I can compare tenures for your eligible products.';
+      specialChips = chipsForContext();
     }
   } else if (/show all products/.test(tl)) {
     specialHtml = '<strong>All Available Products</strong>'
@@ -862,9 +884,14 @@ async function sendMessage(text) {
       + '</tbody></table></div>';
     specialChips = ['Check my eligibility', 'Compare tenures', 'Calculate EMI'];
   } else if (/download summary/.test(tl)) {
-    downloadSummary();
-    specialHtml = '📄 Your summary has been downloaded!';
-    specialChips = ['Compare tenures', 'Show all products'];
+    if (!userProfile.loanAmount || !userProfile.income || userProfile.existingEMI == null || !userProfile.employmentType) {
+      specialHtml = '⚠️ I need a bit more information before generating your summary. Please share your loan amount, income, existing EMI, and employment type first.';
+      specialChips = chipsForContext();
+    } else {
+      downloadSummary();
+      specialHtml = '📄 Your summary has been downloaded!';
+      specialChips = ['Compare tenures', 'Show all products'];
+    }
   }
 
   if (specialHtml) {
@@ -899,7 +926,19 @@ async function sendMessage(text) {
     const errMsg = isCors
       ? '⚠️ <strong>Connection blocked (CORS).</strong><br>Serve this file via a local server:<br><br><code>python3 -m http.server 8080</code><br><br>Then visit <strong>http://localhost:8080</strong>'
       : `⚠️ Sorry, I'm having trouble connecting. Please try again.<br><small style="color:#94a3b8">${escapeHtml(err.message)}</small>`;
-    addMessage('bot', errMsg, ['Try again']);
+    // "Try again" retries the actual last user message, not the literal text
+    const retryChip = document.createElement('button');
+    retryChip.className = 'chip';
+    retryChip.textContent = '🔄 Try again';
+    retryChip.onclick = () => {
+      chatHistory.pop(); // remove the failed user message so it's not doubled
+      sendMessage(lastUserMessage);
+    };
+    const errRow = addMessage('bot', errMsg, []);
+    const chipRow = document.createElement('div');
+    chipRow.className = 'chips';
+    chipRow.appendChild(retryChip);
+    errRow.parentElement.parentElement.appendChild(chipRow);
     console.error(err);
   }
 
